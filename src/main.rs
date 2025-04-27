@@ -1,7 +1,7 @@
 //! # Email Sleuth RS
 //!
 //! A Rust application to discover and verify professional email addresses
-//! based on contact names and company websites. Inspired by a similar Python tool.
+//! based on contact names and company websites.
 //! This serves as the main entry point for the application.
 
 #![warn(missing_docs, unreachable_pub, rust_2018_idioms)]

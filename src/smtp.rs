@@ -11,9 +11,7 @@ use rand::Rng;
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::time::Duration;
-
 /// Performs the SMTP RCPT TO check for a single email address.
-/// This attempts to replicate the logic from the Python script's _verify_smtp function.
 /// Uses lower-level SmtpConnection for command control.
 ///
 /// # Arguments
@@ -64,18 +62,89 @@ async fn verify_smtp_email(
 
     let helo_name = lettre::transport::smtp::extension::ClientId::Domain("localhost".to_string());
 
+    // First attempt: Try without TLS (standard connection)
+    let connect_result = try_verify_with_connection(
+        socket_addr,
+        &helo_name,
+        &sender_address,
+        &recipient_address,
+        email,
+        domain,
+        mail_server,
+        false,
+    )
+    .await;
+
+    // If the first attempt failed with a STARTTLS requirement, retry with TLS
+    match &connect_result {
+        Ok(result) => {
+            // Check if the error message indicates STARTTLS is needed
+            let msg = result.message.to_lowercase();
+            if msg.contains("starttls")
+                || msg.contains("tls required")
+                || (msg.contains("530") && msg.contains("5.7.0"))
+            {
+                tracing::info!(target: "smtp_task", 
+                    "Server appears to require STARTTLS, retrying with TLS enabled");
+
+                // Try again with TLS enabled
+                return try_verify_with_connection(
+                    socket_addr,
+                    &helo_name,
+                    &sender_address,
+                    &recipient_address,
+                    email,
+                    domain,
+                    mail_server,
+                    true,
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            tracing::error!(target: "smtp_task", 
+                "Error during verification attempt: {}", e);
+        }
+    }
+
+    connect_result
+}
+
+/// Tries to verify an email using a specific connection type (with or without TLS)
+async fn try_verify_with_connection(
+    socket_addr: std::net::SocketAddr,
+    helo_name: &lettre::transport::smtp::extension::ClientId,
+    sender_address: &Address,
+    recipient_address: &Address,
+    email: &str,
+    domain: &str,
+    mail_server: &str,
+    use_tls: bool,
+) -> Result<SmtpVerificationResult> {
+    let tls_parameters = if use_tls {
+        Some(
+            lettre::transport::smtp::client::TlsParameters::new(mail_server.to_string()).map_err(
+                |e| AppError::SmtpTls(format!("Failed to create TLS parameters: {}", e)),
+            )?,
+        )
+    } else {
+        None
+    };
+
     let mut smtp_conn = match SmtpConnection::connect(
         socket_addr,
         Some(CONFIG.smtp_timeout),
-        &helo_name,
-        None,
+        helo_name,
+        tls_parameters.as_ref(),
         None,
     ) {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!(target: "smtp_task", "SMTP connection failed for {}: {}", mail_server, e);
-
             let err_string = e.to_string();
+            tracing::warn!(target: "smtp_task", 
+                "SMTP connection failed for {} (TLS={}): {}", 
+                mail_server, use_tls, e);
+
             if err_string.contains("timed out") || err_string.contains("connection refused") {
                 tracing::error!(target: "smtp_task", 
                     "Port 25 appears to be blocked by your ISP or network. Consider using a different network or VPN.");
@@ -89,17 +158,21 @@ async fn verify_smtp_email(
         }
     };
 
+    tracing::debug!(target: "smtp_task", 
+        "Established {} connection to {}:{}", 
+        if use_tls { "TLS" } else { "plaintext" }, 
+        mail_server,
+        socket_addr.port());
+
     match smtp_conn.command(Ehlo::new(helo_name.clone())) {
         Ok(_) => {
-            tracing::debug!(target: "smtp_task", "Initial EHLO successful");
+            tracing::debug!(target: "smtp_task", "EHLO successful");
         }
         Err(e) => {
-            tracing::warn!(target: "smtp_task", "Initial EHLO failed: {}", e);
+            tracing::warn!(target: "smtp_task", "EHLO failed: {}", e);
             return Ok(handle_smtp_error(&e, mail_server));
         }
     }
-
-    tracing::debug!(target: "smtp_task", "SMTP connection established to {}:{}", mail_server, socket_addr.port());
 
     tracing::debug!(target: "smtp_task", "Sending MAIL FROM:<{}>...", &CONFIG.smtp_sender_email);
     match smtp_conn.command(Mail::new(Some(sender_address.clone()), vec![])) {
@@ -107,15 +180,31 @@ async fn verify_smtp_email(
             if response.is_positive() {
                 tracing::debug!(target: "smtp_task", "MAIL FROM accepted by {}: {:?}", mail_server, response);
             } else {
+                let message = response.message().collect::<Vec<&str>>().join(" ");
                 tracing::error!(target: "smtp_task",
-                    "SMTP sender '{}' rejected by {}: {:?}",
-                    &CONFIG.smtp_sender_email, mail_server, response
+                    "SMTP sender '{}' rejected by {}: {} {:?}",
+                    &CONFIG.smtp_sender_email, mail_server, response.code(), message
                 );
+
+                // Check if server requires STARTTLS but we didn't detect it
+                if message.to_lowercase().contains("starttls")
+                    || (response.code().to_string().starts_with("530") && message.contains("5.7.0"))
+                {
+                    tracing::warn!(target: "smtp_task", 
+                        "Server requires STARTTLS but current connection doesn't support it");
+                    smtp_conn.quit().ok();
+                    return Ok(SmtpVerificationResult::inconclusive_retry(format!(
+                        "Server requires STARTTLS: {} {}",
+                        response.code(),
+                        message
+                    )));
+                }
+
                 smtp_conn.quit().ok();
                 return Ok(SmtpVerificationResult::inconclusive_no_retry(format!(
                     "MAIL FROM rejected: {} {}",
                     response.code(),
-                    response.message().collect::<Vec<&str>>().join(" ")
+                    message
                 )));
             }
         }
@@ -238,9 +327,9 @@ async fn verify_smtp_email(
             ];
             let message_lower = target_message.to_lowercase();
 
-            let code_value = u16::from(target_code);
+            let code_value = target_code.to_string();
 
-            if [550, 551, 553].contains(&code_value)
+            if ["550", "551", "553"].contains(&code_value.as_str())
                 || rejection_phrases.iter().any(|p| message_lower.contains(p))
             {
                 SmtpVerificationResult::conclusive(
@@ -281,6 +370,18 @@ fn handle_smtp_error(
     server: &str,
 ) -> SmtpVerificationResult {
     let err_string = error.to_string();
+
+    // Check if the error is related to STARTTLS requirement
+    if err_string.contains("STARTTLS")
+        || err_string.contains("starttls")
+        || (err_string.contains("530") && err_string.contains("5.7.0"))
+    {
+        tracing::warn!(target: "smtp_task", "Server {} requires STARTTLS: {}", server, error);
+        return SmtpVerificationResult::inconclusive_retry(format!(
+            "SMTP requires TLS encryption: {}",
+            err_string
+        ));
+    }
 
     if err_string.contains("550")
         && (err_string.contains("does not exist")

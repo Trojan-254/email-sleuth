@@ -43,7 +43,6 @@ impl EmailSleuth {
     /// Finds and verifies email addresses for a given contact.
     ///
     /// This is the main entry point for the finding logic corresponding to the
-    /// Python class's `find_email` method.
     ///
     /// # Arguments
     /// * `contact` - A validated contact with required information.
