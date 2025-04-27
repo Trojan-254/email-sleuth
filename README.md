@@ -173,7 +173,7 @@ The tool produces a detailed JSON output for each contact processed. In CLI mode
 `email-sleuth` uses a layered configuration system:
 
 1.  **Command-line Arguments**: Highest priority. Overrides all other settings. (e.g., `--concurrency 8`)
-2.  **Configuration File (TOML)**: Third priority. Loaded automatically if found.
+2.  **Configuration File (TOML)**: Second priority. Loaded automatically if found.
 3.  **Default Values**: Lowest priority. Used if no other setting is provided.
 
 ### Configuration File
