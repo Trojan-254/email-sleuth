@@ -699,7 +699,7 @@ fi
 
 # Build and execute the command
 if [[ "$SINGLE_MODE" == true ]]; then
-    CMD="\"$EMAIL_SLEUTH\" --name \"$NAME\" --domain \"$DOMAIN\" --stdout true $VERIFICATION_ARGS $CONCURRENCY"
+    CMD="\"$EMAIL_SLEUTH\" --name \"$NAME\" --domain \"$DOMAIN\" --stdout $VERIFICATION_ARGS $CONCURRENCY"
     echo "Finding email for \"$NAME\" at \"$DOMAIN\" using $MODE verification..."
 else
     # Check if input file exists for batch mode
