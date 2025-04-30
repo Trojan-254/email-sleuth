@@ -1,109 +1,244 @@
-//! # Email Sleuth RS
+//! # Email Sleuth CLI
 //!
-//! A Rust application to discover and verify professional email addresses
-//! based on contact names and company websites.
-//! This serves as the main entry point for the application.
+//! Command-line interface for the Email Sleuth library (`email_sleuth_core`).
+//! This binary parses arguments, sets up configuration, initializes the core sleuth logic,
+//! processes contacts (either single or from a file), and handles output.
 
-#![warn(missing_docs, unreachable_pub, rust_2018_idioms)]
+use email_sleuth_core::{
+    check_smtp_connectivity, find_single_email, initialize_sleuth, process_contacts, Config,
+    ConfigBuilder, Contact, EmailSleuth, ProcessingResult,
+};
 
-mod config;
-mod dns;
-mod domain;
-mod error;
-mod models;
-mod patterns;
-mod processor;
-mod scraper;
-mod sleuth;
-mod smtp;
-
-use crate::config::CONFIG;
-use crate::models::{Contact, ProcessingResult};
-use crate::processor::process_record;
-use crate::sleuth::EmailSleuth;
-
+// Dependencies specific to the CLI binary
 use anyhow::{Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
+use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use smtp::test_smtp_connectivity;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing_subscriber::FmtSubscriber;
+use std::time::{Duration, Instant};
+use tracing;
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter, FmtSubscriber};
 
-/// Main entry point for the Email Sleuth application.
-///
-/// Initializes logging, loads configuration, reads input data,
-/// processes contacts concurrently, and writes results.
+// Defines the command-line arguments accepted by the binary.
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Discovers and verifies professional email addresses.",
+    long_about = "Email Sleuth uses pattern generation, website scraping, and verification (SMTP, API, Headless) to find email addresses based on names and domains."
+)]
+struct AppArgs {
+    /// Path to the input JSON file containing contacts (required in file mode).
+    #[arg(short, long, default_value = "input.json", env = "EMAIL_SLEUTH_INPUT")]
+    input: String,
+
+    /// Path to the output JSON file where results will be saved.
+    #[arg(
+        short,
+        long,
+        default_value = "results.json",
+        env = "EMAIL_SLEUTH_OUTPUT"
+    )]
+    output: String,
+
+    /// Name of the person to find email for (enables single contact CLI mode). Requires --domain.
+    #[arg(long, env = "EMAIL_SLEUTH_NAME", requires = "domain")]
+    // Require domain if name is given
+    name: Option<String>,
+
+    /// Domain or website URL to search against (enables single contact CLI mode). Requires --name.
+    #[arg(long, env = "EMAIL_SLEUTH_DOMAIN", requires = "name")]
+    // Require name if domain is given
+    domain: Option<String>,
+
+    /// Output results to standard output instead of a file (only in single contact CLI mode).
+    #[arg(long, default_value = "false", env = "EMAIL_SLEUTH_STDOUT")]
+    stdout: bool,
+
+    /// Path to a configuration file (TOML format) to load settings from. CLI args override file settings.
+    #[arg(long, env = "EMAIL_SLEUTH_CONFIG")]
+    config_file: Option<String>,
+
+    /// Maximum number of concurrent processing tasks.
+    #[arg(short, long, env = "EMAIL_SLEUTH_CONCURRENCY")]
+    concurrency: Option<usize>,
+
+    /// Sender email address for SMTP verification checks.
+    #[arg(long, env = "EMAIL_SLEUTH_SMTP_SENDER")]
+    smtp_sender: Option<String>,
+
+    /// User agent string for HTTP scraping requests.
+    #[arg(long, env = "EMAIL_SLEUTH_USER_AGENT")]
+    user_agent: Option<String>,
+
+    /// SMTP connection/command timeout in seconds.
+    #[arg(long, env = "EMAIL_SLEUTH_SMTP_TIMEOUT")]
+    smtp_timeout: Option<u64>,
+
+    /// HTTP request timeout in seconds.
+    #[arg(long, env = "EMAIL_SLEUTH_REQUEST_TIMEOUT")]
+    request_timeout: Option<u64>,
+
+    /// DNS resolution timeout in seconds.
+    #[arg(long, env = "EMAIL_SLEUTH_DNS_TIMEOUT")]
+    dns_timeout: Option<u64>,
+
+    /// Comma-separated list of DNS servers to use for lookups.
+    #[arg(long, value_delimiter = ',', env = "EMAIL_SLEUTH_DNS_SERVERS")]
+    dns_servers: Option<Vec<String>>,
+
+    /// Enable experimental API-based verification checks (e.g., M365).
+    #[arg(long, action = clap::ArgAction::SetTrue, env = "EMAIL_SLEUTH_ENABLE_API_CHECKS")]
+    enable_api_checks: Option<bool>,
+
+    /// Enable experimental headless browser verification checks (e.g., Yahoo). Requires WebDriver.
+    #[arg(long, action = clap::ArgAction::SetTrue, env = "EMAIL_SLEUTH_ENABLE_HEADLESS_CHECKS")]
+    enable_headless_checks: Option<bool>,
+
+    #[arg(long, env = "EMAIL_SLEUTH_EARLY_TERM_THRESHOLD")]
+    early_termination_threshold: Option<u8>,
+
+    /// URL of the running WebDriver instance (required if --enable-headless-checks is used).
+    #[arg(long, env = "EMAIL_SLEUTH_WEBDRIVER_URL")]
+    webdriver_url: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Initialize tracing subscriber to handle logs based on RUST_LOG env var or default level.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(env_filter)
         .with_thread_names(true)
         .with_target(true)
+        .with_span_events(FmtSpan::CLOSE)
+        .compact()
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default tracing subscriber failed");
+        .context("Setting up tracing subscriber failed")?;
 
     tracing::info!(
-        "Logging initialized. Starting Email Sleuth RS v{}...",
+        "Email Sleuth CLI v{} starting...",
         env!("CARGO_PKG_VERSION")
     );
-    tracing::debug!("Debug logging is enabled.");
-    tracing::debug!("Using configuration: {:?}", *CONFIG);
 
-    if let Err(e) = test_smtp_connectivity().await {
-        tracing::error!("SMTP connectivity test failed: {}", e);
-        tracing::error!(
-            "This application requires outbound SMTP (port 25) connectivity to function properly"
-        );
-        tracing::error!("Common solutions:");
-        tracing::error!("1. Use a VPN to bypass port 25 blocking");
-        tracing::error!(
-            "2. Run this application on a cloud server (most cloud providers allow outbound port 25)"
-        );
+    let args = AppArgs::parse();
+    tracing::debug!("Parsed CLI arguments: {:?}", args);
 
-        return Err(anyhow::anyhow!("SMTP connectivity check failed: {}", e));
+    // Use the ConfigBuilder from the core library.
+    let mut config_builder = ConfigBuilder::new();
+
+    // Load from specified config file first, if provided.
+    if let Some(ref path) = args.config_file {
+        config_builder = config_builder.config_file(path);
     }
 
-    let start_time = std::time::Instant::now();
+    if let Some(c) = args.concurrency {
+        config_builder = config_builder.max_concurrency(c);
+    }
+    if let Some(ref s) = args.smtp_sender {
+        config_builder = config_builder.smtp_sender_email(s);
+    }
+    if let Some(ref ua) = args.user_agent {
+        config_builder = config_builder.user_agent(ua);
+    }
+    if let Some(t) = args.smtp_timeout {
+        config_builder = config_builder.smtp_timeout(Duration::from_secs(t));
+    }
+    if let Some(t) = args.request_timeout {
+        config_builder = config_builder.request_timeout(Duration::from_secs(t));
+    }
+    if let Some(t) = args.dns_timeout {
+        config_builder = config_builder.dns_timeout(Duration::from_secs(t));
+    }
+    if let Some(ref servers) = args.dns_servers {
+        if !servers.is_empty() {
+            config_builder = config_builder.dns_servers(servers.clone());
+        }
+    }
+    if args.enable_api_checks == Some(true) {
+        config_builder = config_builder.enable_api_checks(true);
+    }
+    if args.enable_headless_checks == Some(true) {
+        config_builder = config_builder.enable_headless_checks(true);
+    }
+    if let Some(threshold) = args.early_termination_threshold {
+        config_builder = config_builder.early_termination_threshold(threshold);
+    }
 
-    if CONFIG.cli_mode {
-        process_cli_mode().await?;
+    if let Some(ref url) = args.webdriver_url {
+        config_builder = config_builder.webdriver_url(Some(url));
+    }
+
+    let config = match config_builder.build() {
+        Ok(cfg) => Arc::new(cfg),
+        Err(e) => {
+            tracing::error!("Configuration error: {}", e);
+            return Err(anyhow::anyhow!("Failed to build configuration: {}", e));
+        }
+    };
+    tracing::debug!("Effective configuration loaded: {:?}", *config);
+
+    let sleuth = match initialize_sleuth(&config).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("Initialization error: {}", e);
+            return Err(anyhow::anyhow!(
+                "Failed to initialize EmailSleuth core: {}",
+                e
+            ));
+        }
+    };
+
+    // Perform an early check to see if outbound port 25 seems usable.
+    match check_smtp_connectivity().await {
+        Ok(_) => tracing::info!(
+            "SMTP connectivity test to Google passed (outbound port 25 likely open)."
+        ),
+        Err(e) => {
+            // Log clearly but don't necessarily exit, as alternative methods might work.
+            tracing::error!("SMTP connectivity test failed: {}", e);
+            tracing::warn!("Standard SMTP verification (port 25) may fail or be unreliable.");
+            tracing::warn!("Check firewall rules or ISP restrictions if SMTP checks are needed.");
+        }
+    }
+
+    let is_cli_mode = args.name.is_some();
+    let start_time = Instant::now();
+
+    let execution_result = if is_cli_mode {
+        process_cli_mode(&config, &sleuth, &args).await
     } else {
-        process_file_mode().await?;
+        process_file_mode(config.clone(), sleuth, &args, start_time).await
+    };
+
+    if let Err(e) = execution_result {
+        tracing::error!("Execution failed: {}", e);
+        return Err(e);
     }
 
-    tracing::info!(
-        "Script finished successfully. Duration: {:.2?}",
-        start_time.elapsed()
-    );
+    if !is_cli_mode {
+        tracing::info!(
+            "Processing finished successfully. Total duration: {:.2?}",
+            start_time.elapsed()
+        );
+    }
     Ok(())
 }
 
-/// Process a single contact provided via command line arguments
-async fn process_cli_mode() -> Result<()> {
-    tracing::info!("Running in CLI mode");
-    let name = CONFIG.cli_name.as_ref().unwrap();
-    let domain_input = CONFIG.cli_domain.as_ref().unwrap();
+async fn process_cli_mode(config: &Config, sleuth: &EmailSleuth, args: &AppArgs) -> Result<()> {
+    tracing::info!("Running in Single Contact CLI mode.");
+    let start_time = Instant::now();
+    let name = args.name.as_ref().cloned().unwrap();
+    let domain_input = args.domain.as_ref().cloned().unwrap();
 
     let name_parts: Vec<&str> = name.split_whitespace().collect();
-    let first_name = if !name_parts.is_empty() {
-        Some(name_parts[0].to_string())
-    } else {
-        None
-    };
-    let last_name = if name_parts.len() > 1 {
-        Some(name_parts.last().unwrap().to_string())
-    } else {
-        first_name.clone()
-    };
+    let first_name = name_parts.get(0).map(|s| s.to_string());
+    let last_name = name_parts.last().map(|s| s.to_string());
 
     let contact = Contact {
         first_name,
@@ -114,390 +249,305 @@ async fn process_cli_mode() -> Result<()> {
         other_fields: std::collections::HashMap::new(),
     };
 
-    tracing::info!("Finding email for name: {}, domain: {}", name, domain_input);
-
-    let sleuth = Arc::new(
-        EmailSleuth::new()
-            .await
-            .context("Failed to initialize EmailSleuth")?,
+    tracing::info!(
+        "Finding email for Name='{}', Domain='{}'",
+        name,
+        domain_input
     );
 
-    let result = process_record(sleuth, contact).await;
+    let result = find_single_email(config, sleuth, contact).await;
 
-    if CONFIG.output_to_stdout {
-        print_cli_results(&result);
+    if args.stdout {
+        print_cli_results(&result, config);
     } else {
-        tracing::info!("Saving result to '{}'...", CONFIG.output_file);
-        save_results(&[result], &CONFIG.output_file)?;
-        tracing::info!("Result saved successfully to '{}'.", CONFIG.output_file);
+        tracing::info!("Saving result to '{}'...", args.output);
+        save_results(&[result], &args.output)?;
+        tracing::info!("Result saved successfully to '{}'.", args.output);
     }
-
+    tracing::info!("CLI mode finished. Duration: {:.2?}", start_time.elapsed());
     Ok(())
 }
 
-/// Print CLI results to stdout in a human-readable format
-fn print_cli_results(result: &ProcessingResult) {
-    println!("\n===== Email Sleuth Results =====");
-    println!(
-        "Name: {}",
-        result.contact_input.full_name.as_deref().unwrap_or("N/A")
+async fn process_file_mode(
+    config: Arc<Config>,
+    sleuth: Arc<EmailSleuth>,
+    args: &AppArgs,
+    start_time: Instant,
+) -> Result<()> {
+    tracing::info!(
+        "Running in File Processing mode. Input: '{}', Output: '{}'",
+        args.input,
+        args.output
     );
-    println!(
-        "Domain: {}",
-        result.contact_input.domain.as_deref().unwrap_or("N/A")
-    );
+    let input_path = Path::new(&args.input);
+    let output_path = Path::new(&args.output);
 
-    if result.email_finding_skipped {
-        println!("\nStatus: SKIPPED");
-        println!(
-            "Reason: {}",
-            result.email_finding_reason.as_deref().unwrap_or("Unknown")
-        );
-    } else if let Some(error) = &result.email_finding_error {
-        println!("\nStatus: ERROR");
-        println!("Error: {}", error);
-    } else if let Some(email) = &result.email {
-        println!("\nStatus: SUCCESS");
-        println!("Email: {}", email);
-        println!("Confidence: {}/10", result.email_confidence.unwrap_or(0));
-        println!(
-            "Method: {}",
-            result
-                .email_verification_method
-                .as_deref()
-                .unwrap_or("Unknown")
-        );
-
-        if !result.email_alternatives.is_empty() {
-            println!("\nAlternative emails:");
-            for alt in &result.email_alternatives {
-                println!("- {}", alt);
-            }
-        }
-    } else {
-        println!("\nStatus: NO EMAIL FOUND");
-        if result.email_verification_failed {
-            println!("Verification failed for potential candidates");
-        }
-    }
-
-    if let Some(email_results) = &result.email_discovery_results {
-        if !email_results.verification_log.is_empty() {
-            println!("\nVerification details:");
-            for (email, message) in &email_results.verification_log {
-                println!("- {}: {}", email, message);
-            }
-        }
-    }
-
-    println!("==============================\n");
-}
-
-/// Process contacts from a file (existing functionality)
-async fn process_file_mode() -> Result<()> {
-    let start_time = std::time::Instant::now();
-    let input_path = Path::new(&CONFIG.input_file);
-    if !input_path.exists() {
-        tracing::error!("Input file '{}' not found", CONFIG.input_file);
-        tracing::error!(
-            "Please check that the file exists and that you have permission to read it"
-        );
-        tracing::error!("Use --input to specify a different input file");
+    if !input_path.exists() || !input_path.is_file() {
         return Err(anyhow::anyhow!(
-            "Input file not found: {}",
-            CONFIG.input_file
+            "Input file not found or is not a file: {}",
+            args.input
         ));
     }
-
-    if !input_path.is_file() {
-        tracing::error!("'{}' is not a file", CONFIG.input_file);
-        return Err(anyhow::anyhow!(
-            "Input path is not a file: {}",
-            CONFIG.input_file
-        ));
-    }
-
-    let output_path = Path::new(&CONFIG.output_file);
     if let Some(parent_dir) = output_path.parent() {
-        if !parent_dir.exists() && !parent_dir.as_os_str().is_empty() {
-            tracing::error!("Output directory '{}' does not exist", parent_dir.display());
-            return Err(anyhow::anyhow!(
-                "Output directory does not exist: {}",
-                parent_dir.display()
-            ));
-        }
-
-        if !parent_dir.as_os_str().is_empty() {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&CONFIG.output_file)
-            {
-                Ok(_) => {
-                    if output_path.exists() {
-                        let _ = std::fs::remove_file(&CONFIG.output_file);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Cannot write to output file '{}': {}",
-                        CONFIG.output_file,
-                        e
-                    );
-                    return Err(anyhow::anyhow!("Cannot write to output file: {}", e));
-                }
-            }
+        if !parent_dir.as_os_str().is_empty() && !parent_dir.exists() {
+            tracing::debug!("Creating output directory: {}", parent_dir.display());
+            std::fs::create_dir_all(parent_dir).with_context(|| {
+                format!(
+                    "Failed to create output directory '{}'",
+                    parent_dir.display()
+                )
+            })?;
         }
     }
+    File::create(&args.output).with_context(|| {
+        format!(
+            "Cannot write to output file '{}'. Check permissions.",
+            args.output
+        )
+    })?;
+    tracing::debug!("Output path '{}' seems writable.", args.output);
 
-    tracing::info!("Loading input data from '{}'...", CONFIG.input_file);
-    let records: Vec<Contact> = match load_contacts(&CONFIG.input_file) {
-        Ok(records) => records,
-        Err(e) => {
-            tracing::error!(
-                "Failed to load contacts from '{}': {}",
-                CONFIG.input_file,
-                e
-            );
-            tracing::error!("Please ensure the file contains valid JSON in the expected format");
-            tracing::error!(
-                "Example format: [{{\"first_name\":\"John\",\"last_name\":\"Doe\",\"company_domain\":\"example.com\"}}]"
-            );
-            return Err(anyhow::anyhow!("Failed to parse input file: {}", e));
-        }
-    };
-
-    let total_records = records.len();
-    if total_records == 0 {
+    tracing::info!("Loading contacts from '{}'...", args.input);
+    let contacts = load_contacts(&args.input)?;
+    let total_records_loaded = contacts.len();
+    if total_records_loaded == 0 {
         tracing::warn!(
-            "Input file '{}' contains zero records. Exiting.",
-            CONFIG.input_file
+            "Input file '{}' is empty or contains no valid contacts. Saving empty results file.",
+            args.input
         );
+        save_results(&[], &args.output)?;
         return Ok(());
     }
-
-    let mut invalid_records = 0;
-    for (i, record) in records.iter().enumerate() {
-        let has_name = record.full_name.is_some()
-            || (record.first_name.is_some() && record.last_name.is_some());
-
-        let has_domain = record.domain.is_some() || record.company_domain.is_some();
-
-        if !has_name || !has_domain {
-            tracing::warn!(
-                "Record #{} is missing required fields. Each record needs either 'full_name' or both 'first_name' and 'last_name', plus 'domain'",
-                i + 1
-            );
-            invalid_records += 1;
-        }
-    }
-
-    if invalid_records > 0 {
-        tracing::warn!(
-            "{} out of {} records are missing required fields. These records will be skipped during processing.",
-            invalid_records,
-            total_records
-        );
-
-        if invalid_records == total_records {
-            tracing::error!("All records are invalid. Please check your input file format.");
-            tracing::error!(
-                "Expected format: [{{\"first_name\":\"John\",\"last_name\":\"Doe\",\"domain\":\"example.com\"}}]"
-            );
-            return Err(anyhow::anyhow!("All records in input file are invalid"));
-        }
-    }
+    tracing::info!("Loaded {} records from input file.", total_records_loaded);
 
     tracing::info!(
-        "Loaded {} valid records for processing.",
-        total_records - invalid_records
+        "Starting email discovery for {} records (Concurrency: {})...",
+        total_records_loaded,
+        config.max_concurrency
     );
-
-    tracing::debug!("Initializing EmailSleuth instance...");
-    let sleuth = Arc::new(
-        EmailSleuth::new()
-            .await
-            .context("Failed to initialize EmailSleuth")?,
-    );
-    tracing::debug!("EmailSleuth initialized.");
-
-    tracing::info!(
-        "Starting email discovery for {} records using up to {} concurrent tasks...",
-        total_records,
-        CONFIG.max_concurrency
-    );
-
-    let pb = ProgressBar::new(total_records as u64);
+    let pb = ProgressBar::new(total_records_loaded as u64);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | ETA: {eta_precise}")?
-        .progress_chars("#>-"));
+         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | ETA: {eta} | {msg}")
+         .context("Failed to set progress bar template")?
+         .progress_chars("=> "));
+    pb.set_message("Processing contacts...");
 
-    let mut tasks = FuturesUnordered::new();
-    let mut processed_records = Vec::with_capacity(total_records);
+    let processed_results_unordered = process_contacts(config.clone(), sleuth, contacts).await;
 
-    for record in records {
-        if tasks.len() >= CONFIG.max_concurrency {
-            if let Some(result) = tasks.next().await {
-                match result {
-                    Ok(processed) => {
-                        processed_records.push(processed);
-                        pb.inc(1);
-                    }
-                    Err(e) => {
-                        tracing::error!("A processing task panicked: {}", e);
-                        pb.inc(1);
-                    }
-                }
-            }
-        }
+    pb.set_position(processed_results_unordered.len() as u64); // Ensure bar shows full completion
+    pb.finish_with_message(format!(
+        "Processed {} records",
+        processed_results_unordered.len()
+    ));
 
-        let sleuth_clone = Arc::clone(&sleuth);
-        tasks.push(tokio::spawn(async move {
-            process_record(sleuth_clone, record).await
-        }));
-    }
-
-    // Process remaining tasks
-    while let Some(result) = tasks.next().await {
-        match result {
-            Ok(processed) => {
-                processed_records.push(processed);
-                pb.inc(1);
-            }
-            Err(e) => {
-                tracing::error!("A processing task panicked: {}", e);
-                pb.inc(1);
-            }
-        }
-    }
-
-    pb.finish_with_message("Processing complete");
-
-    let output_file = &CONFIG.output_file;
-    tracing::info!(
-        "Processing finished. Saving {} results to '{}'...",
-        processed_records.len(),
-        output_file
-    );
-
-    processed_records.sort_by(|a, b| {
-        let name_a = a
+    let mut processed_results = processed_results_unordered;
+    tracing::info!("Sorting {} results...", processed_results.len());
+    processed_results.sort_by(|a, b| {
+        let domain_a = a
             .contact_input
-            .full_name
+            .domain
             .as_deref()
-            .or(a.contact_input.first_name.as_deref())
+            .or(a.contact_input.company_domain.as_deref())
             .unwrap_or("");
-        let name_b = b
+        let domain_b = b
             .contact_input
-            .full_name
+            .domain
             .as_deref()
-            .or(b.contact_input.first_name.as_deref())
+            .or(b.contact_input.company_domain.as_deref())
             .unwrap_or("");
-        name_a.cmp(name_b)
+        let name_a = a.contact_input.full_name.as_deref().unwrap_or("");
+        let name_b = b.contact_input.full_name.as_deref().unwrap_or("");
+        let lname_a = a.contact_input.last_name.as_deref().unwrap_or("");
+        let lname_b = b.contact_input.last_name.as_deref().unwrap_or("");
+        let fname_a = a.contact_input.first_name.as_deref().unwrap_or("");
+        let fname_b = b.contact_input.first_name.as_deref().unwrap_or("");
+
+        (domain_a, lname_a, fname_a, name_a).cmp(&(domain_b, lname_b, fname_b, name_b))
     });
 
-    match save_results(&processed_records, output_file) {
-        Ok(_) => tracing::info!("Results saved successfully to '{}'.", output_file),
-        Err(e) => {
-            tracing::error!("Failed to save results to '{}': {}", output_file, e);
-            return Err(anyhow::anyhow!("Failed to save results: {}", e));
-        }
-    }
+    tracing::info!("Saving results to '{}'...", args.output);
+    save_results(&processed_results, &args.output)?;
+    tracing::info!("Results saved successfully.");
 
-    let duration = start_time.elapsed();
-    log_summary(&processed_records, total_records, duration);
+    log_summary(
+        &processed_results,
+        total_records_loaded,
+        start_time.elapsed(),
+    );
 
     Ok(())
 }
 
-/// Loads contact records from the specified JSON file with improved error handling.
 fn load_contacts(file_path: &str) -> Result<Vec<Contact>> {
+    tracing::debug!("Opening input file: {}", file_path);
     let file = File::open(file_path)
-        .with_context(|| format!("Failed to open input file '{}' for reading", file_path))?;
-
+        .with_context(|| format!("Failed to open input file '{}'", file_path))?;
     let reader = BufReader::new(file);
 
-    let records: serde_json::Result<Vec<Contact>> = serde_json::from_reader(reader);
+    tracing::debug!("Parsing JSON from file: {}", file_path);
+    let records: Vec<Contact> = serde_json::from_reader(reader).with_context(|| {
+        format!(
+            "Failed to parse JSON from '{}'. Ensure it's an array of contact objects.",
+            file_path
+        )
+    })?;
 
-    match records {
-        Ok(data) => Ok(data),
-        Err(e) => {
-            if e.is_syntax() {
-                Err(anyhow::anyhow!(
-                    "JSON syntax error in '{}': {}",
-                    file_path,
-                    e
-                ))
-            } else if e.is_data() {
-                Err(anyhow::anyhow!(
-                    "JSON data structure doesn't match expected format in '{}': {}",
-                    file_path,
-                    e
-                ))
-            } else if e.is_eof() {
-                Err(anyhow::anyhow!(
-                    "Unexpected end of JSON data in '{}': {}",
-                    file_path,
-                    e
-                ))
-            } else {
-                Err(anyhow::anyhow!(
-                    "Error parsing JSON from '{}': {}",
-                    file_path,
-                    e
-                ))
-            }
-        }
-    }
+    Ok(records)
 }
 
-/// Saves the processed results to the specified JSON file with improved error handling.
+/// Saves the processed results to the specified JSON file.
+/// Uses `serde_json` with pretty printing for human readability.
 fn save_results(results: &[ProcessingResult], file_path: &str) -> Result<()> {
+    tracing::debug!("Creating output file: {}", file_path);
     let file = File::create(file_path)
-        .with_context(|| format!("Failed to create output file '{}' for writing", file_path))?;
-
+        .with_context(|| format!("Failed to create/truncate output file '{}'", file_path))?;
     let writer = BufWriter::new(file);
 
+    tracing::debug!(
+        "Writing {} results as JSON to file: {}",
+        results.len(),
+        file_path
+    );
     serde_json::to_writer_pretty(writer, results)
         .with_context(|| format!("Failed to serialize results to JSON for '{}'", file_path))?;
 
     Ok(())
 }
 
-/// Logs a summary of the processing results.
-fn log_summary(processed_records: &[ProcessingResult], original_total: usize, duration: Duration) {
-    let effective_total = processed_records.len();
-    let likely_emails_found = processed_records
+/// Logs a summary of the processing results to the console using `tracing::info`.
+fn log_summary(processed_results: &[ProcessingResult], original_total: usize, duration: Duration) {
+    let total_records_processed_or_skipped = processed_results.len();
+    let successful_finds = processed_results
         .iter()
-        .filter(|r| {
-            r.email.is_some() && !r.email_finding_skipped && r.email_finding_error.is_none()
-        })
+        .filter(|r| r.email.is_some())
         .count();
-    let skipped_count = processed_records
+    let skipped_input = processed_results
         .iter()
         .filter(|r| r.email_finding_skipped)
         .count();
-    let error_count = processed_records
+    let processing_errors = processed_results
         .iter()
         .filter(|r| r.email_finding_error.is_some())
         .count();
-    let failed_or_low_confidence = effective_total
-        .saturating_sub(likely_emails_found)
-        .saturating_sub(skipped_count)
-        .saturating_sub(error_count);
+    let verification_failures = processed_results
+        .iter()
+        .filter(|r| {
+            !r.email_finding_skipped && r.email_finding_error.is_none() && r.email.is_none()
+        })
+        .count();
 
-    tracing::info!("-------------------- Summary --------------------");
-    tracing::info!("Total Records Input     : {}", original_total);
+    tracing::info!("-------------------- Processing Summary --------------------");
+    tracing::info!("Total Records in Input File : {}", original_total);
     tracing::info!(
-        "Total Records Processed : {}/{}",
-        effective_total,
-        original_total
+        "Records Processed/Attempted : {}",
+        total_records_processed_or_skipped
     );
-    tracing::info!("Likely Emails Found     : {}", likely_emails_found);
-    tracing::info!("Failed / Low Confidence : {}", failed_or_low_confidence);
-    tracing::info!("Records Skipped (Input) : {}", skipped_count);
-    tracing::info!("Records with Errors     : {}", error_count);
-    tracing::info!("Total Time Taken        : {:.2?}", duration);
-    tracing::info!("-------------------------------------------------");
+    tracing::info!("  - Likely Emails Found     : {}", successful_finds);
+    tracing::info!("  - No Email Found/Verified : {}", verification_failures);
+    tracing::info!("  - Skipped (Invalid Input) : {}", skipped_input);
+    tracing::info!("  - Errors During Processing: {}", processing_errors);
+    tracing::info!("Total Time Taken            : {:.2?}", duration);
+    if duration.as_secs_f64() > 0.01 && total_records_processed_or_skipped > 0 {
+        let rate = (total_records_processed_or_skipped as f64) / duration.as_secs_f64();
+        tracing::info!("Processing Rate             : {:.2} records/sec", rate);
+    }
+    tracing::info!("----------------------------------------------------------");
+}
+
+/// Prints results for a single contact to standard output (CLI mode).
+fn print_cli_results(result: &ProcessingResult, config: &Config) {
+    const BLUE: &str = "\x1b[34m";
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const RED: &str = "\x1b[31m";
+    const RESET: &str = "\x1b[0m";
+
+    println!("\n{BLUE}===== Email Sleuth Results ====={RESET}");
+    println!(
+        "Name:   {}",
+        result.contact_input.full_name.as_deref().unwrap_or("N/A")
+    );
+    println!(
+        "Domain: {}",
+        result
+            .contact_input
+            .domain
+            .as_deref()
+            .or(result.contact_input.company_domain.as_deref())
+            .unwrap_or("N/A")
+    );
+
+    if result.email_finding_skipped {
+        println!("\n{YELLOW}Status: SKIPPED{RESET}");
+        println!(
+            "Reason: {}",
+            result.email_finding_reason.as_deref().unwrap_or("Unknown")
+        );
+    } else if let Some(error) = &result.email_finding_error {
+        println!("\n{RED}Status: ERROR{RESET}");
+        println!("Error:  {}", error);
+    } else if let Some(email) = &result.email {
+        println!("\n{GREEN}Status: SUCCESS{RESET}");
+        println!("Email:      {GREEN}{}{RESET}", email);
+        println!("Confidence: {}/10", result.email_confidence.unwrap_or(0));
+        if let Some(ref method) = result.email_verification_method {
+            println!("Source:     {}", method);
+        }
+    } else {
+        println!("\n{YELLOW}Status: NO EMAIL FOUND{RESET}");
+        if result.email_verification_failed {
+            println!(
+                "Reason: No candidates met the required confidence threshold after verification."
+            );
+        } else if result
+            .email_discovery_results
+            .as_ref()
+            .map_or(true, |r| r.found_emails.is_empty())
+        {
+            println!("Reason: No potential email candidates were generated or found.");
+        } else {
+            println!("Reason: Unknown (processed without error, but no email selected).");
+        }
+    }
+
+    if !result.email_alternatives.is_empty() {
+        println!(
+            "\n{BLUE}Alternative Emails (Confidence > 0, up to {}):{RESET}",
+            config.max_alternatives
+        );
+        for alt in result.email_alternatives.iter() {
+            let details = result
+                .email_discovery_results
+                .as_ref()
+                .and_then(|disc_res| {
+                    disc_res
+                        .found_emails
+                        .iter()
+                        .find(|fe| fe.email == *alt)
+                        .map(|fe| format!(" (Conf: {}, Src: {})", fe.confidence, fe.source))
+                })
+                .unwrap_or_default();
+            println!("- {}{}", alt, details);
+        }
+    }
+
+    if let Some(ref discovery_results) = result.email_discovery_results {
+        if !discovery_results.verification_log.is_empty() {
+            println!("\n{BLUE}Verification Log:{RESET}");
+            let mut log_entries: Vec<_> = discovery_results.verification_log.iter().collect();
+            log_entries.sort_by_key(|(k, _)| *k);
+            for (email, message) in log_entries {
+                let cleaned_message = message
+                    .replace('\n', " ")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                println!("- {}: {}", email, cleaned_message);
+            }
+        }
+    }
+
+    println!("{BLUE}=============================={RESET}\n");
 }

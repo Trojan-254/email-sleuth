@@ -1,15 +1,20 @@
 //! Defines the custom error types for the email-sleuth application.
 
+use fantoccini::error::{CmdError, NewSessionError};
 use std::{io, net::AddrParseError};
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
 /// The primary error type for the email finding process.
 #[derive(Error, Debug)]
-pub(crate) enum AppError {
+pub enum AppError {
     /// Error occurring during configuration loading or validation.
     #[error("Configuration Error: {0}")]
     Config(String),
+
+    /// Error initializing necessary components (e.g., clients, resolvers).
+    #[error("Initialization Error: {0}")]
+    Initialization(String),
 
     /// Error related to file input/output operations.
     #[error("IO Error: {0}")]
@@ -95,6 +100,39 @@ pub(crate) enum AppError {
     /// SMTP verification was inconclusive (e.g., catch-all, timeout).
     #[error("SMTP Inconclusive: {0}")]
     SmtpInconclusive(String),
+
+    /// Error connecting to the WebDriver instance.
+    #[error("WebDriver Connection Error: {0}")]
+    WebDriverConnection(String),
+
+    /// Indicates that the verification process was actively blocked (e.g., by CAPTCHA).
+    #[error("Verification Blocked: {0}")]
+    VerificationBlocked(String),
+
+    /// Error executing a command via WebDriver (Fantoccini).
+    #[error("WebDriver Command Error: {0}")]
+    FantocciniCmd(String),
 }
 
-pub(crate) type Result<T> = std::result::Result<T, AppError>;
+// From implementations for Fantoccini errors
+impl From<CmdError> for AppError {
+    fn from(err: CmdError) -> Self {
+        let msg = err.to_string();
+        if msg.contains("element click intercepted") || msg.contains("element is not interactable")
+        {
+            // Potentially we can classify this as VerificationBlocked if it's consistently due to anti-bot measures?
+            // AppError::VerificationBlocked(format!("Interaction blocked: {}", msg))
+            AppError::FantocciniCmd(msg)
+        } else {
+            AppError::FantocciniCmd(msg)
+        }
+    }
+}
+
+impl From<NewSessionError> for AppError {
+    fn from(err: NewSessionError) -> Self {
+        AppError::WebDriverConnection(err.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, AppError>;

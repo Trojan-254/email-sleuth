@@ -107,18 +107,20 @@ generic_confidence_threshold = 7
 # Default: 5
 max_alternatives = 5
 
+# The confidence threshold (0-10) for early termination. When a candidate email is verified
+# with a confidence score >= this value, processing will stop early and no further candidates
+# will be checked. Set to 10 to always check all candidates, or lower to optimize performance.
+# Default: 9
+early_termination_threshold = 9
+
 # Default maximum number of concurrent tasks (processing contacts or performing network operations).
 # Can be overridden by the --concurrency CLI argument.
 # Default: 8
 max_concurrency = 8
 
-# Settings for default input and output file paths
-# These are typically overridden by the -i and -o CLI arguments.
-[input_output]
-# Default path to the input JSON file.
-# Default: "input.json"
-input_file = "input.json"
-
-# Default path for the output JSON results file.
-# Default: "results.json"
-output_file = "results.json"
+# Optional: Settings for advanced/experimental verification methods
+# These require additional setup (like running a WebDriver) and may be less stable than SMTP.
+[advanced_verification]
+enable_api_checks = true
+enable_headless_checks = false
+webdriver_url = "http://localhost:4444" # URL of running WebDriver instance

@@ -1,11 +1,11 @@
 //! Functions for performing DNS lookups (MX, A records).
 
-use crate::config::CONFIG;
-use crate::error::{AppError, Result};
+use crate::core::config::Config;
+use crate::core::error::{AppError, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
+use trust_dns_resolver::TokioAsyncResolver;
 
 /// Represents the result of a mail server lookup.
 #[derive(Debug, Clone)]
@@ -18,10 +18,10 @@ pub(crate) struct MailServer {
 }
 
 /// Creates a configured DNS resolver instance.
-pub(crate) async fn create_resolver() -> Result<TokioAsyncResolver> {
+pub(crate) async fn create_resolver(config: &Config) -> Result<TokioAsyncResolver> {
     let mut resolver_config = ResolverConfig::new();
 
-    for server_str in &CONFIG.dns_servers {
+    for server_str in &config.dns_servers {
         match IpAddr::from_str(server_str) {
             Ok(ip_addr) => {
                 // Default DNS port is 53
@@ -56,7 +56,7 @@ pub(crate) async fn create_resolver() -> Result<TokioAsyncResolver> {
     }
 
     let mut resolver_opts = ResolverOpts::default();
-    resolver_opts.timeout = CONFIG.dns_timeout;
+    resolver_opts.timeout = config.dns_timeout;
     resolver_opts.attempts = 2;
     resolver_opts.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
 

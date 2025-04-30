@@ -2,12 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use url::Url; // Import Url type
+use url::Url;
 
 /// Represents the input contact record read from the JSON file.
 /// Allows for flexibility if some fields are missing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct Contact {
+pub struct Contact {
     /// The contact's first name.
     pub first_name: Option<String>,
     /// The contact's last name.
@@ -27,7 +27,7 @@ pub(crate) struct Contact {
 
 /// Represents a single email address found and its associated metadata.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct FoundEmailData {
+pub struct FoundEmailData {
     /// The discovered email address.
     pub email: String,
     /// A score indicating the likelihood of this email being correct (0-10).
@@ -45,7 +45,7 @@ pub(crate) struct FoundEmailData {
 /// Contains the results of the email finding process for a single contact.
 /// This structure will be added to the original Contact data before saving.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub(crate) struct EmailResult {
+pub struct EmailResult {
     /// A list of all potentially valid emails found, ordered by likelihood.
     pub found_emails: Vec<FoundEmailData>,
     /// The single email address deemed most likely to be correct.
@@ -60,7 +60,7 @@ pub(crate) struct EmailResult {
 
 /// Represents the final output structure for each record, combining input and results.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct ProcessingResult {
+pub struct ProcessingResult {
     // Include all fields from the original Contact input
     #[serde(flatten)]
     pub contact_input: Contact,
@@ -84,7 +84,7 @@ pub(crate) struct ProcessingResult {
 
     // Status/Error fields
     /// Flag indicating if the record was skipped due to missing input.
-    #[serde(skip_serializing_if = "std::ops::Not::not")] // Don't write if false
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[serde(default)]
     pub email_finding_skipped: bool,
     /// Reason why the record was skipped.
@@ -93,7 +93,7 @@ pub(crate) struct ProcessingResult {
     /// Flag indicating verification failed definitively for the top choices.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[serde(default)]
-    pub email_verification_failed: bool, // Set if no likely email found/verified
+    pub email_verification_failed: bool,
     /// Error message if processing failed unexpectedly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email_finding_error: Option<String>,
@@ -101,7 +101,8 @@ pub(crate) struct ProcessingResult {
 
 /// Internal representation after validating input Contact
 #[derive(Debug, Clone)]
-pub(crate) struct ValidatedContact {
+#[allow(dead_code)]
+pub struct ValidatedContact {
     pub first_name: String,
     pub last_name: String,
     /// Guaranteed to be populated (either from input or constructed).
@@ -116,7 +117,8 @@ pub(crate) struct ValidatedContact {
 
 /// Internal representation of SMTP verification outcome
 #[derive(Debug, Clone)]
-pub(crate) struct SmtpVerificationResult {
+#[allow(dead_code)]
+pub struct SmtpVerificationResult {
     /// True = Exists, False = Does Not Exist, None = Inconclusive/Error
     pub exists: Option<bool>,
     /// Detailed message about the outcome.
@@ -126,10 +128,10 @@ pub(crate) struct SmtpVerificationResult {
     /// Indicates if the domain seems to accept all emails.
     pub is_catch_all: bool,
 }
-
+#[allow(dead_code)]
 impl SmtpVerificationResult {
     /// Creates a conclusive result (email definitely exists or not).
-    pub(crate) fn conclusive(exists: bool, message: String, is_catch_all: bool) -> Self {
+    pub fn conclusive(exists: bool, message: String, is_catch_all: bool) -> Self {
         Self {
             exists: Some(exists),
             message,
@@ -139,7 +141,7 @@ impl SmtpVerificationResult {
     }
 
     /// Creates an inconclusive result where retrying might help.
-    pub(crate) fn inconclusive_retry(message: String) -> Self {
+    pub fn inconclusive_retry(message: String) -> Self {
         Self {
             exists: None,
             message,
@@ -149,7 +151,7 @@ impl SmtpVerificationResult {
     }
 
     /// Creates an inconclusive result where retrying is unlikely to help.
-    pub(crate) fn inconclusive_no_retry(message: String) -> Self {
+    pub fn inconclusive_no_retry(message: String) -> Self {
         Self {
             exists: None,
             message,

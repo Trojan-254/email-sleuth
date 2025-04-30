@@ -1,43 +1,57 @@
 [package]
 name = "email-sleuth"
-version = "0.1.0"
-edition = "2024"
-authors = ["Kerim Buyukakyuz kerim@trylon.ai"]
+version = "1.1.0"
+edition = "2021"
+authors = ["Kerim Buyukakyuz <kerim@trylon.ai>"]
 description = "A tool to find and verify email addresses associated with contacts and company websites."
 license = "MIT"
 repository = "https://github.com/tokenizer-decode/email-sleuth"
 
+[lib]
+name = "email_sleuth_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "email-sleuth"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-futures = "0.3.31"
-tokio-rustls = "0.26.2"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rustls = "0.21"
-scraper = "0.23.1"
+tokio-rustls = "0.24"
+rustls-native-certs = "0.6"
+scraper = "0.19"
+url = { version = "2.5", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-url = { version = "2.5", features = ["serde"] }
 regex = "1.10"
-trust-dns-resolver = { version = "0.23", features = ["tokio", "rustls"] }
-lettre = { version = "0.11", default-features = false, features = [
-    "tokio1", 
-    "builder", 
-    "smtp-transport", 
-    "rustls", 
-    "tokio1-rustls",
-    "ring",
-    "rustls-native-certs"
-]}
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-indicatif = { version = "0.17", features = ["tokio"] }
 rand = "0.8"
+once_cell = "1"
+chrono = "0.4"
 thiserror = "1"
 anyhow = "1"
-once_cell = "1"
+trust-dns-resolver = { version = "0.23", features = ["tokio", "rustls"] }
+
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "builder",
+    "smtp-transport",
+    "rustls",
+    "tokio1-rustls",
+    "rustls-native-certs",
+    "ring"
+]}
+
+fantoccini = "0.19"
 clap = { version = "4.4", features = ["derive", "env"] }
+indicatif = { version = "0.17", features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+parking_lot = "0.12.3"
+
 [profile.release]
 lto = true
 codegen-units = 1
