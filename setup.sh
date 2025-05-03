@@ -231,7 +231,12 @@ install_email_sleuth() {
     fi
 
     # Find the binary, handle potential subdirectories in archive
-    FOUND_BINARY=$(find . -name "$BINARY_NAME" -type f -executable | head -n 1)
+    # Make the script more macOS friendly
+    if [[ "$(uname)" == "Darwin" ]]; then
+        FOUND_BINARY=$(find . -name "$BINARY_NAME" -type f | head -n 1)
+    else
+        FOUND_BINARY=$(find . -name "$BINARY_NAME" -type f -executable | head -n 1)
+    fi
     if [[ -z "$FOUND_BINARY" ]]; then
         echo -e "${RED}Error: No executable named '$BINARY_NAME' found in the archive.${NC}"
         popd > /dev/null
