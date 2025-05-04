@@ -45,29 +45,35 @@ pub fn detect_driver_path(config: &Config) -> Result<PathBuf> {
         return Ok(default_driver_path);
     }
 
+    // Make CI/CD happy. This fails on release but not on my machine. Weird.
     let mut common_paths = Vec::new();
 
     // Unix-like systems (Linux, macOS)
     #[cfg(unix)]
     {
         // Common to both Linux and macOS
-        common_paths.push("/usr/local/bin/chromedriver");
-        common_paths.push("/usr/bin/chromedriver");
+        common_paths.push(PathBuf::from("/usr/local/bin/chromedriver"));
+        common_paths.push(PathBuf::from("/usr/bin/chromedriver"));
 
         // macOS specific paths
         #[cfg(target_os = "macos")]
         {
-            common_paths.push("/Applications/Google Chrome.app/Contents/MacOS/chromedriver");
+            common_paths.push(PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/chromedriver",
+            ));
 
             // Homebrew on Intel Macs
-            common_paths.push("/usr/local/Cellar/chromedriver/latest/bin/chromedriver");
+            common_paths.push(PathBuf::from(
+                "/usr/local/Cellar/chromedriver/latest/bin/chromedriver",
+            ));
 
             // Homebrew on Apple Silicon
-            common_paths.push("/opt/homebrew/bin/chromedriver");
+            common_paths.push(PathBuf::from("/opt/homebrew/bin/chromedriver"));
 
             // User Applications folder
             if let Ok(home) = std::env::var("HOME") {
-                common_paths.push(&format!("{}/Applications/chromedriver", home));
+                let home_path = PathBuf::from(home);
+                common_paths.push(home_path.join("Applications/chromedriver"));
             }
         }
     }
@@ -75,23 +81,27 @@ pub fn detect_driver_path(config: &Config) -> Result<PathBuf> {
     // Windows-specific paths
     #[cfg(windows)]
     {
-        common_paths.push("C:\\Program Files\\Google\\Chrome\\Application\\chromedriver.exe");
-        common_paths.push("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chromedriver.exe");
+        common_paths.push(PathBuf::from(
+            "C:\\Program Files\\Google\\Chrome\\Application\\chromedriver.exe",
+        ));
+        common_paths.push(PathBuf::from(
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chromedriver.exe",
+        ));
 
         // User profile location
         if let Ok(profile) = std::env::var("USERPROFILE") {
-            common_paths.push(&format!(
-                "{}\\AppData\\Local\\Google\\Chrome\\Application\\chromedriver.exe",
-                profile
-            ));
+            let profile_path = PathBuf::from(profile);
+            common_paths.push(
+                profile_path.join("AppData\\Local\\Google\\Chrome\\Application\\chromedriver.exe"),
+            );
         }
     }
 
-    for path_str in common_paths {
-        let path = PathBuf::from(path_str);
+    // Check all paths
+    for path in &common_paths {
         if path.exists() && path.is_file() {
             tracing::debug!("Found ChromeDriver at: {}", path.display());
-            return Ok(path);
+            return Ok(path.clone());
         }
     }
 
