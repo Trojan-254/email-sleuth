@@ -11,7 +11,7 @@ use email_sleuth_core::{
 
 // Dependencies specific to the CLI binary
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -21,7 +21,29 @@ use std::time::{Duration, Instant};
 use tracing;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter, FmtSubscriber};
 
-// Defines the command-line arguments accepted by the binary.
+mod service;
+
+/// Verification modes that determine which verification methods are enabled
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum VerificationMode {
+    /// Basic verification using SMTP only
+    Basic,
+    /// Enhanced verification using SMTP and API checks
+    Enhanced,
+    /// Comprehensive verification using all methods
+    Comprehensive,
+}
+
+impl std::fmt::Display for VerificationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerificationMode::Basic => write!(f, "basic"),
+            VerificationMode::Enhanced => write!(f, "enhanced"),
+            VerificationMode::Comprehensive => write!(f, "comprehensive"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -103,11 +125,26 @@ struct AppArgs {
     /// URL of the running WebDriver instance (required if --enable-headless-checks is used).
     #[arg(long, env = "EMAIL_SLEUTH_WEBDRIVER_URL")]
     webdriver_url: Option<String>,
+
+    /// Path to ChromeDriver executable. If not specified, will try to detect automatically.
+    #[arg(long, env = "EMAIL_SLEUTH_CHROMEDRIVER_PATH")]
+    chromedriver_path: Option<String>,
+
+    /// Verification mode (determines which methods are enabled)
+    #[arg(short, long, value_enum, default_value_t = VerificationMode::Basic)]
+    mode: VerificationMode,
+
+    /// Manage ChromeDriver service (start, stop, restart, status, logs)
+    #[arg(long)]
+    service: Option<String>,
+
+    /// Number of log lines to show when using --service logs
+    #[arg(long, default_value_t = 20)]
+    log_lines: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber to handle logs based on RUST_LOG env var or default level.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let subscriber = FmtSubscriber::builder()
@@ -129,12 +166,34 @@ async fn main() -> Result<()> {
     let args = AppArgs::parse();
     tracing::debug!("Parsed CLI arguments: {:?}", args);
 
-    // Use the ConfigBuilder from the core library.
     let mut config_builder = ConfigBuilder::new();
 
-    // Load from specified config file first, if provided.
     if let Some(ref path) = args.config_file {
         config_builder = config_builder.config_file(path);
+    }
+
+    match args.mode {
+        VerificationMode::Basic => {
+            // Basic mode just uses SMTP (default behavior)
+        }
+        VerificationMode::Enhanced => {
+            config_builder = config_builder.enable_api_checks(true);
+            tracing::info!("Enhanced verification mode: Enabling API checks");
+        }
+        VerificationMode::Comprehensive => {
+            config_builder = config_builder
+                .enable_api_checks(true)
+                .enable_headless_checks(true);
+
+            if args.webdriver_url.is_none() {
+                config_builder = config_builder.webdriver_url(Some("http://localhost:4444"));
+                tracing::info!("Using default WebDriver URL: http://localhost:4444");
+            }
+
+            tracing::info!(
+                "Comprehensive verification mode: Enabling API and headless browser checks"
+            );
+        }
     }
 
     if let Some(c) = args.concurrency {
@@ -169,9 +228,11 @@ async fn main() -> Result<()> {
     if let Some(threshold) = args.early_termination_threshold {
         config_builder = config_builder.early_termination_threshold(threshold);
     }
-
     if let Some(ref url) = args.webdriver_url {
         config_builder = config_builder.webdriver_url(Some(url));
+    }
+    if let Some(ref path) = args.chromedriver_path {
+        config_builder = config_builder.chromedriver_path(Some(path));
     }
 
     let config = match config_builder.build() {
@@ -182,6 +243,19 @@ async fn main() -> Result<()> {
         }
     };
     tracing::debug!("Effective configuration loaded: {:?}", *config);
+
+    if let Some(service_cmd) = args.service.as_deref() {
+        return handle_service_command(service_cmd, args.log_lines, &config).await;
+    }
+
+    if matches!(args.mode, VerificationMode::Comprehensive) {
+        if let Err(e) = ensure_chromedriver_running(&config).await {
+            tracing::warn!("ChromeDriver service issue: {}", e);
+            if args.webdriver_url.is_none() {
+                tracing::warn!("Comprehensive mode may not work fully due to ChromeDriver issues");
+            }
+        }
+    }
 
     let sleuth = match initialize_sleuth(&config).await {
         Ok(s) => Arc::new(s),
@@ -194,13 +268,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Perform an early check to see if outbound port 25 seems usable.
     match check_smtp_connectivity().await {
         Ok(_) => tracing::info!(
             "SMTP connectivity test to Google passed (outbound port 25 likely open)."
         ),
         Err(e) => {
-            // Log clearly but don't necessarily exit, as alternative methods might work.
             tracing::error!("SMTP connectivity test failed: {}", e);
             tracing::warn!("Standard SMTP verification (port 25) may fail or be unreliable.");
             tracing::warn!("Check firewall rules or ISP restrictions if SMTP checks are needed.");
@@ -227,6 +299,82 @@ async fn main() -> Result<()> {
             start_time.elapsed()
         );
     }
+
+    if matches!(args.mode, VerificationMode::Comprehensive) {
+        if let Ok(running) = service::chromedriver::status(&config).await {
+            if running {
+                tracing::info!("ChromeDriver service is still running. You can stop it with: email-sleuth --service stop");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensures the ChromeDriver service is running for comprehensive mode
+async fn ensure_chromedriver_running(config: &Config) -> Result<()> {
+    if let Ok(running) = service::chromedriver::status(config).await {
+        if running {
+            tracing::info!("ChromeDriver service is already running");
+            return Ok(());
+        }
+    }
+
+    tracing::info!("Starting ChromeDriver service for comprehensive verification...");
+    service::chromedriver::start(config)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start ChromeDriver: {}", e))
+}
+
+/// Handles service management commands
+async fn handle_service_command(command: &str, log_lines: usize, config: &Config) -> Result<()> {
+    match command {
+        "start" => {
+            service::chromedriver::start(config)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start ChromeDriver service: {}", e))?;
+            println!("ChromeDriver service started successfully");
+        }
+        "stop" => {
+            service::chromedriver::stop(config)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to stop ChromeDriver service: {}", e))?;
+            println!("ChromeDriver service stopped successfully");
+        }
+        "restart" => {
+            service::chromedriver::restart(config)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to restart ChromeDriver service: {}", e))?;
+            println!("ChromeDriver service restarted successfully");
+        }
+        "status" => {
+            let running = service::chromedriver::status(config).await.map_err(|e| {
+                anyhow::anyhow!("Failed to check ChromeDriver service status: {}", e)
+            })?;
+
+            if running {
+                println!("ChromeDriver service is running and responsive");
+            } else {
+                println!("ChromeDriver service is not running or not responsive");
+                return Err(anyhow::anyhow!(
+                    "ChromeDriver service is not running or not responsive"
+                ));
+            }
+        }
+        "logs" => {
+            let logs = service::chromedriver::logs(log_lines)
+                .map_err(|e| anyhow::anyhow!("Failed to retrieve ChromeDriver logs: {}", e))?;
+
+            println!("ChromeDriver Logs (last {} lines):", log_lines);
+            println!("----------------------------------------");
+            println!("{}", logs);
+            println!("----------------------------------------");
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unknown service command: {}. Valid commands are: start, stop, restart, status, logs", command));
+        }
+    }
+
     Ok(())
 }
 
@@ -250,9 +398,10 @@ async fn process_cli_mode(config: &Config, sleuth: &EmailSleuth, args: &AppArgs)
     };
 
     tracing::info!(
-        "Finding email for Name='{}', Domain='{}'",
+        "Finding email for Name='{}', Domain='{}' (Mode: {})",
         name,
-        domain_input
+        domain_input,
+        args.mode
     );
 
     let result = find_single_email(config, sleuth, contact).await;
@@ -275,9 +424,10 @@ async fn process_file_mode(
     start_time: Instant,
 ) -> Result<()> {
     tracing::info!(
-        "Running in File Processing mode. Input: '{}', Output: '{}'",
+        "Running in File Processing mode. Input: '{}', Output: '{}' (Mode: {})",
         args.input,
-        args.output
+        args.output,
+        args.mode
     );
     let input_path = Path::new(&args.input);
     let output_path = Path::new(&args.output);

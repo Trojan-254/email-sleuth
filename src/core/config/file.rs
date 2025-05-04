@@ -66,4 +66,5 @@ pub(crate) struct AdvancedVerificationConfig {
     pub(crate) enable_api_checks: Option<bool>,
     pub(crate) enable_headless_checks: Option<bool>,
     pub(crate) webdriver_url: Option<String>,
+    pub(crate) chromedriver_path: Option<String>,
 }

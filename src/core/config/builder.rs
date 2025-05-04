@@ -103,7 +103,10 @@ impl ConfigBuilder {
         self.overrides.advanced_verification.webdriver_url = url.map(|s| s.into());
         self
     }
-
+    pub fn chromedriver_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.overrides.advanced_verification.chromedriver_path = path.map(|s| s.into());
+        self
+    }
     /// Builds the final `Config` object, applying defaults, file settings, overrides, and validation.
     pub fn build(mut self) -> Result<Config> {
         let mut loaded_path: Option<String> = None;

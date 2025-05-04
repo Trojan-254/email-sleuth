@@ -122,5 +122,5 @@ max_concurrency = 8
 # These require additional setup (like running a WebDriver) and may be less stable than SMTP.
 [advanced_verification]
 enable_api_checks = true
-enable_headless_checks = false
+enable_headless_checks = true
 webdriver_url = "http://localhost:4444" # URL of running WebDriver instance

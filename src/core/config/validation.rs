@@ -64,6 +64,11 @@ pub(crate) fn validate_config(config: &mut Config) -> Result<()> {
     if !config.enable_headless_checks && config.webdriver_url.is_some() {
         tracing::warn!("A WebDriver URL was provided, but headless checks are disabled. The URL will be ignored.");
     }
-
+    if let Some(ref path) = config.chromedriver_path {
+        if path.is_empty() {
+            tracing::warn!("Provided ChromeDriver path is empty. It will be ignored.");
+            config.chromedriver_path = None;
+        }
+    }
     Ok(())
 }

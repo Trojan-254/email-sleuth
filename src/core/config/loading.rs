@@ -109,4 +109,11 @@ pub(crate) fn apply_file_config(config: &mut Config, file_config: &ConfigFile) {
             config.webdriver_url = None
         }
     }
+    if let Some(ref path) = file_config.advanced_verification.chromedriver_path {
+        if !path.trim().is_empty() {
+            config.chromedriver_path = Some(path.trim().to_string());
+        } else {
+            config.chromedriver_path = None;
+        }
+    }
 }

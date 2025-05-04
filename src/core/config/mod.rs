@@ -39,6 +39,7 @@ pub struct Config {
     pub enable_api_checks: bool,
     pub enable_headless_checks: bool,
     pub webdriver_url: Option<String>,
+    pub chromedriver_path: Option<String>,
 
     pub early_termination_threshold: u8,
 
@@ -136,6 +137,7 @@ impl Config {
             enable_api_checks: false,
             enable_headless_checks: false,
             webdriver_url: None,
+            chromedriver_path: None,
             early_termination_threshold: 9,
             loaded_config_path: None,
         }
@@ -169,6 +171,7 @@ impl Clone for Config {
             enable_api_checks: self.enable_api_checks,
             enable_headless_checks: self.enable_headless_checks,
             webdriver_url: self.webdriver_url.clone(),
+            chromedriver_path: self.chromedriver_path.clone(),
             early_termination_threshold: self.early_termination_threshold,
             loaded_config_path: self.loaded_config_path.clone(),
         }
@@ -205,6 +208,7 @@ impl std::fmt::Debug for Config {
             .field("enable_api_checks", &self.enable_api_checks)
             .field("enable_headless_checks", &self.enable_headless_checks)
             .field("webdriver_url", &self.webdriver_url)
+            .field("chromedriver_path", &self.chromedriver_path)
             .field(
                 "early_termination_threshold",
                 &self.early_termination_threshold,
