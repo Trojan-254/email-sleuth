@@ -55,7 +55,7 @@ indicatif = { version = "0.17", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 parking_lot = "0.12.3"
-
+openssl-sys = { version = "0.9", features = ["vendored"] }
 [profile.release]
 lto = true
 codegen-units = 1
