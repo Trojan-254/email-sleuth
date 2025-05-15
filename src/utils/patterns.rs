@@ -89,8 +89,9 @@ pub(crate) fn generate_email_patterns(
     patterns.insert(format!("{}-{}", first, last_initial)); // john-d
 
     // Substring patterns: first 3 letters of first + full last
-    if first.len() >= 3 {
-        patterns.insert(format!("{}{}", &first[0..3], last));
+    if first.chars().count() >= 3 {
+        let first_three: String = first.chars().take(3).collect();
+        patterns.insert(format!("{}{}", first_three, last));
     }
 
     // Single-initial patterns
